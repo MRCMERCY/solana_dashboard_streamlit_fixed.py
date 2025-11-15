@@ -1,4 +1,6 @@
-# SOLANA USD Live Predictor Optimised for Free Hosting
+# Full Fixed Version — Live Price + Zoomed Graphs + No Crashes on Free Tier
+# Works on Streamlit Community Cloud (ephemeral storage)
+
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -6,7 +8,6 @@ from xgboost import XGBRegressor
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error
 import joblib
-import argparse
 import os
 import matplotlib.pyplot as plt
 import streamlit as st
@@ -61,6 +62,7 @@ def create_features(df, lags=5, horizon=12):
 # ----------------------------------------------------
 # DATA FETCHING
 # ----------------------------------------------------
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_data(symbol, period, interval):
     try:
         df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
@@ -69,11 +71,12 @@ def fetch_data(symbol, period, interval):
         if df.empty:
             return None
         return df[['Open', 'High', 'Low', 'Close', 'Volume']]
-    except:
+    except Exception as e:
+        st.error(f"Data fetch failed: {e}")
         return None
 
 # ----------------------------------------------------
-# MODEL TRAINING
+# MODEL TRAINING (Faster + Safer for Free Tier)
 # ----------------------------------------------------
 def train_model(df, timeframe, horizon=12):
     df_feat = create_features(df, horizon=horizon)
@@ -87,11 +90,25 @@ def train_model(df, timeframe, horizon=12):
 
     models = []
     for col in y_train.columns:
-        model = XGBRegressor(n_estimators=300, learning_rate=0.05, random_state=42)
+        model = XGBRegressor(
+            n_estimators=100,           # Reduced from 300 → fast & safe
+            learning_rate=0.1,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=42,
+            n_jobs=1,                   # Critical: 1 job on free tier
+            tree_method='hist'
+        )
         model.fit(X_train, y_train[col])
         models.append(model)
 
-    joblib.dump(models, f"{timeframe}_model.pkl")
+    # Save safely
+    model_file = f"{timeframe}_model.pkl"
+    try:
+        joblib.dump(models, model_file)
+    except:
+        pass  # Ignore save errors — will retrain next time
     return models
 
 # ----------------------------------------------------
@@ -100,7 +117,6 @@ def train_model(df, timeframe, horizon=12):
 def predict_next_12_candles(models, df_feat, horizon=12):
     last_row = df_feat.drop([f'target_{h}' for h in range(1, horizon + 1)] +
                              ['Open', 'High', 'Low', 'Close', 'Volume'], axis=1).iloc[-1]
-
     return [model.predict(last_row.values.reshape(1, -1))[0] for model in models]
 
 # ----------------------------------------------------
@@ -115,7 +131,7 @@ def plot_predictions(df, preds, timeframe, symbol):
     freq_map = {'5m': '5min', '15m': '15min', '1h': 'H', '4h': '4H', '1d': 'D'}
     future_times = pd.date_range(df.index[-1], periods=len(preds) + 1, freq=freq_map[timeframe])[1:]
 
-    ax.plot(future_times, preds, marker='x', linestyle='--', label='Prediction')
+    ax.plot(future_times, preds, marker='x', linestyle='--', label='Prediction', color='red')
 
     # ---- ZOOM FIX ----
     if len(df) >= 48:
@@ -124,33 +140,56 @@ def plot_predictions(df, preds, timeframe, symbol):
         view_start = df.index[0]
 
     ax.set_xlim(view_start, future_times[-1])
-
     ax.set_title(f"{symbol} Prediction ({timeframe})")
-    ax.grid(True)
+    ax.grid(True, alpha=0.3)
     ax.legend()
 
-    ax2.bar(df.tail(48).index, df['Volume'].tail(48))
-    ax2.grid(True)
+    ax2.bar(df.tail(48).index, df['Volume'].tail(48), color='lightblue', alpha=0.7)
+    ax2.grid(True, alpha=0.3)
     ax2.set_title("Volume (Last 48 Candles)")
 
-    fig.tight_layout()
+    plt.close(fig)  # Prevent memory leak
     return fig
 
 # ----------------------------------------------------
-# STREAMLIT DASHBOARD (LIVE PRICE + FIXED SPACING)
+# SAFE MODEL LOADER (No EOFError on Free Tier)
+# ----------------------------------------------------
+def load_or_train_model(df, timeframe):
+    model_file = f"{timeframe}_model.pkl"
+    models = None
+
+    if os.path.exists(model_file):
+        try:
+            if os.path.getsize(model_file) > 1000:  # Not empty
+                models = joblib.load(model_file)
+                st.toast(f"Loaded {timeframe.upper()} model", icon="Loaded")
+        except Exception as e:
+            st.warning(f"Model corrupted, retraining {timeframe.upper()}...")
+
+    if models is None:
+        with st.spinner(f"Training {timeframe.upper()} model..."):
+            models = train_model(df, timeframe)
+        st.toast(f"{timeframe.upper()} model trained!", icon="Trained")
+
+    return models
+
+# ----------------------------------------------------
+# STREAMLIT DASHBOARD
 # ----------------------------------------------------
 def run_dashboard(symbol="SOL-USD", refresh_rate=300):
     st.set_page_config(page_title=f"{symbol} Dashboard", layout="wide")
-    st.title(f"📈 {symbol} Prediction Dashboard")
+    st.title(f"{symbol} Prediction Dashboard")
 
     # Auto-refresh
     st_autorefresh(interval=refresh_rate * 1000, key="refresh")
 
-    # ---- LIVE PRICE RESTORED ----
+    # ---- LIVE PRICE ----
     current_df = fetch_data(symbol, '1d', '1m')
-    if current_df is not None:
+    if current_df is not None and len(current_df) > 0:
         live_price = float(current_df['Close'].iloc[-1])
-        st.metric("Live Price", f"${live_price:.4f}")
+        st.metric("Live Price", f"${live_price:.4f}", delta=None)
+    else:
+        st.warning("Live price unavailable")
 
     timeframes = {
         '5m': '5d',
@@ -169,8 +208,9 @@ def run_dashboard(symbol="SOL-USD", refresh_rate=300):
         for tf, period in timeframes.items():
             df = fetch_data(symbol, period, tf)
             if df is not None:
-                train_model(df, tf)
-        st.success("Models retrained.")
+                with st.spinner(f"Retraining {tf.upper()}..."):
+                    train_model(df, tf)
+        st.success("All models retrained!")
 
     cols = st.columns(len(timeframes))
 
@@ -179,15 +219,11 @@ def run_dashboard(symbol="SOL-USD", refresh_rate=300):
             st.subheader(tf.upper())
 
             df = fetch_data(symbol, period, tf)
-            if df is None:
+            if df is None or df.empty:
                 st.warning("No data.")
                 continue
 
-            model_file = f"{tf}_model.pkl"
-            if not os.path.exists(model_file):
-                train_model(df, tf)
-
-            models = joblib.load(model_file)
+            models = load_or_train_model(df, tf)
             df_feat = create_features(df)
             preds = predict_next_12_candles(models, df_feat)
 
@@ -202,24 +238,14 @@ def run_dashboard(symbol="SOL-USD", refresh_rate=300):
             fig = plot_predictions(df, preds, tf, symbol)
             st.pyplot(fig)
 
-            table = pd.DataFrame({"Candle": [f"t+{i}" for i in range(1, 13)],"Prediction": preds})
-            st.dataframe(table)
+            table = pd.DataFrame({
+                "Candle": [f"t+{i}" for i in range(1, 13)],
+                "Prediction": [f"${p:.4f}" for p in preds]
+            })
+            st.dataframe(table, use_container_width=True)
 
 # ----------------------------------------------------
-# MAIN
+# MAIN — Streamlit Cloud Ready
 # ----------------------------------------------------
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--mode', type=str, default='dashboard')
-    parser.add_argument('--symbol', type=str, default='SOL-USD')
-    args = parser.parse_args()
-
-    global symbol
-    symbol = args.symbol
-
-    if args.mode == 'dashboard':
-        run_dashboard(symbol=symbol)
-        return
-
 if __name__ == "__main__":
-    main()
+    run_dashboard(symbol="SOL-USD")
