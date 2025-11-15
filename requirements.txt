@@ -1,0 +1,8 @@
+streamlit>=1.24.0
+yfinance>=0.2.26
+pandas>=1.5.0
+numpy>=1.24.0
+xgboost>=1.7.6
+scikit-learn>=1.2.0
+joblib>=1.2.0
+matplotlib>=3.6.0
